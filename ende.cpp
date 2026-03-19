@@ -1,36 +1,4 @@
-/*
-Modern C++ In-Place AES-GCM File Encryptor/Decryptor
-
-Features:
-- In-place encryption: securely renames the original file to ".enc" and wipes the original securely.
-- When you select a file for encryption, its original file extension (type) is extracted and stored in the encrypted file header.
-- During decryption, the stored extension is reliably read back from the encrypted file and the original file is restored with its proper extension.
-- Utilizes AES-256-GCM for robust authenticated encryption and PBKDF2-HMAC-SHA256 for secure key derivation.
-- File extension storage and restoration logic have been double-checked and optimized so that:
-    * The extension is always correctly saved.
-    * When decrypting, even edge cases (like files with no extension or multiple dots) are handled robustly.
-    * The output filename matches the real original, not simply a renamed or incorrect one.
-    * Possible bugs related to extension extraction, reading, or writing have been fixed:
-        - Extension length/offset mismatches are prevented.
-        - Proper checks are implemented for corrupted or tampered headers.
-- Employs a true worker thread for UI responsiveness, with real-time status and debug output.
-- Modern, clear UI and colors; handles all parameters and errors gracefully.
-- All cryptographic keys/passwords are wiped from memory (SecureZeroMemory) after use.
-- Link statically for portability.
-
-File format for encryption:
-    [MAGIC_HEADER][SALT][IV][GCM_TAG][EXT_LEN (1 byte)][EXT (EXT_LEN bytes)][ENCRYPTED_DATA]
-
-(The 1-byte extension length supports extensions up to 255 characters.)
-
-Compilation command:
-    g++ ende.cpp -mwindows -o ENDE.exe -lcomdlg32 -lgdi32 -luser32 -lbcrypt -lshlwapi -static -static-libgcc -static-libstdc++
-
-Note:
-    - On encrypt, the extension is reliably saved right after the header+tag, before the main encrypted data.
-    - On decrypt, this extension is robustly read and validated before restoring the file; any bug or mismatch due to tampering or corruption will cause a clear error.
-    - Decryption always gives you back the real, correct file extension/type, never just ".dec" or a broken name.
-*/
+//Modern C++ In-Place AES-GCM File Encryptor/Decryptor
 
 #include <windows.h>
 #include <commdlg.h>
