@@ -11,13 +11,16 @@
 #include <thread>
 #include <io.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <algorithm> // For std::min
 
+#ifdef _MSC_VER
 #pragma comment(lib,"bcrypt.lib")
 #pragma comment(lib,"comdlg32.lib")
 #pragma comment(lib,"user32.lib")
 #pragma comment(lib,"gdi32.lib")
 #pragma comment(lib,"shlwapi.lib")
+#endif
 
 #define MAGIC_HEADER "ENCG3M"
 #define MAGIC_LEN 6
@@ -47,6 +50,24 @@ void DebugPrint(const char* fmt, ...) {
     vsnprintf(msg, 512, fmt, args);
     va_end(args);
     printf("%s\n", msg); fflush(stdout);
+}
+
+char* DupString(const char* src) {
+    if (!src) return NULL;
+    size_t len = strlen(src) + 1;
+    char* copy = (char*)malloc(len);
+    if (copy) memcpy(copy, src, len);
+    return copy;
+}
+
+void CopyStringSafe(char* dst, size_t dstSize, const char* src) {
+    if (!dst || dstSize == 0) return;
+    if (!src) {
+        dst[0] = 0;
+        return;
+    }
+    strncpy(dst, src, dstSize - 1);
+    dst[dstSize - 1] = 0;
 }
 
 // Wipe memory robustly: secure overwrite compatible with most compilers
@@ -91,6 +112,10 @@ bool WriteEntireFile(const char* path, const std::vector<BYTE>& data) {
     return true;
 }
 
+bool ReplaceFileWithMove(const char* srcPath, const char* dstPath) {
+    return MoveFileExA(srcPath, dstPath, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED) != 0;
+}
+
 // Robust true file deletion: overwrite, flush, then delete, really removes content on disk
 bool WipeAndDeleteFile(const char* path) {
     FILE* f = fopen(path, "rb+");
@@ -129,15 +154,14 @@ void aesgcm_file_inplace_worker(WorkerParams* params) {
     BYTE salt[SALT_LEN] = {0}, key[KEY_LEN] = {0};
     BYTE iv[IV_LEN] = {0}, headerIV[IV_LEN] = {0};
     BYTE tag[GCM_TAG_LEN] = {0}, storedTag[GCM_TAG_LEN] = {0};
-    char status[256] = "";
     size_t pwlen = strlen(password);
-    FILE* fin = NULL, *fout = NULL;
     int op = params->op;
     BOOL ok = FALSE;
     char outPath[MAX_PATH] = "";
 
     auto sendstat = [&](const char *msg) {
-        PostMessageA(params->replyHwnd, WM_USER_SETS, (WPARAM)strdup(msg), op);
+        char* posted = DupString(msg);
+        if (posted) PostMessageA(params->replyHwnd, WM_USER_SETS, (WPARAM)posted, op);
         if (op == OP_ENCRYPT) DebugPrint("[EncStatus]: %s", msg);
         else if (op == OP_DECRYPT) DebugPrint("[DecStatus]: %s", msg);
     };
@@ -164,13 +188,13 @@ void aesgcm_file_inplace_worker(WorkerParams* params) {
         } else {
             // --- Read header for decryption
             sendstat("Reading header...");
-            fin = fopen(filepath, "rb");
-            if (!fin) { sendstat("Can't open file."); break; }
-            if (fread(headerIV, 1, MAGIC_LEN, fin) != MAGIC_LEN) { sendstat("File too short!"); break; }
-            if (memcmp(headerIV, MAGIC_HEADER, MAGIC_LEN) != 0) { sendstat("Bad magic!"); break; }
-            if (fread(salt, 1, SALT_LEN, fin) != SALT_LEN) { sendstat("Short salt!"); break; }
-            if (fread(headerIV, 1, IV_LEN, fin) != IV_LEN) { sendstat("Short IV!"); break; }
-            if (fread(storedTag, 1, GCM_TAG_LEN, fin) != GCM_TAG_LEN) { sendstat("Short tag!"); break; }
+            std::vector<BYTE> headerData;
+            if (!ReadEntireFile(filepath, headerData)) { sendstat("Can't open file."); break; }
+            if (headerData.size() < (MAGIC_LEN + SALT_LEN + IV_LEN + GCM_TAG_LEN)) { sendstat("File too short!"); break; }
+            if (memcmp(headerData.data(), MAGIC_HEADER, MAGIC_LEN) != 0) { sendstat("Bad magic!"); break; }
+            memcpy(salt, headerData.data() + MAGIC_LEN, SALT_LEN);
+            memcpy(headerIV, headerData.data() + MAGIC_LEN + SALT_LEN, IV_LEN);
+            memcpy(storedTag, headerData.data() + MAGIC_LEN + SALT_LEN + IV_LEN, GCM_TAG_LEN);
             memcpy(iv, headerIV, IV_LEN);
             sendstat("Deriving key...");
             if (!DeriveKey(password, pwlen, salt, SALT_LEN, key)) { sendstat("PBKDF2 fail."); break; }
@@ -193,7 +217,7 @@ void aesgcm_file_inplace_worker(WorkerParams* params) {
             memcpy(aad + MAGIC_LEN, salt, SALT_LEN);
             memcpy(aad + MAGIC_LEN + SALT_LEN, iv, IV_LEN);
 
-            BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO gcm = {0};
+            BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO gcm{};
             BCRYPT_INIT_AUTH_MODE_INFO(gcm);
             gcm.pbNonce = iv; gcm.cbNonce = IV_LEN;
             gcm.pbTag = tag; gcm.cbTag = GCM_TAG_LEN;
@@ -213,27 +237,31 @@ void aesgcm_file_inplace_worker(WorkerParams* params) {
                 sendstat(errDetail);
                 break;
             }
-            // -- Overwrite source file with encrypted data --
-            fout = fopen(filepath, "wb");
-            if (!fout) { sendstat("Can't write file!"); break; }
-            fwrite(MAGIC_HEADER, 1, MAGIC_LEN, fout);
-            fwrite(salt, 1, SALT_LEN, fout);
-            fwrite(iv, 1, IV_LEN, fout);
-            fwrite(tag, 1, GCM_TAG_LEN, fout);
-            fwrite(crypted.data(), 1, cryptlen, fout);
-            fflush(fout);
-            fclose(fout); fout = NULL;
-
-            // Rename to .enc, remove any old .enc file, never keep both!
             char encPath[MAX_PATH];
+            char tempPath[MAX_PATH];
             snprintf(encPath, MAX_PATH, "%s.enc", filepath);
-            DeleteFileA(encPath);
-            if (!MoveFileA(filepath, encPath) && !MoveFileExA(filepath, encPath, MOVEFILE_REPLACE_EXISTING)) {
-                sendstat("Rename fail!"); break;
+            snprintf(tempPath, MAX_PATH, "%s.tmp", encPath);
+
+            std::vector<BYTE> encryptedFile;
+            encryptedFile.reserve(MAGIC_LEN + SALT_LEN + IV_LEN + GCM_TAG_LEN + cryptlen);
+            encryptedFile.insert(encryptedFile.end(), MAGIC_HEADER, MAGIC_HEADER + MAGIC_LEN);
+            encryptedFile.insert(encryptedFile.end(), salt, salt + SALT_LEN);
+            encryptedFile.insert(encryptedFile.end(), iv, iv + IV_LEN);
+            encryptedFile.insert(encryptedFile.end(), tag, tag + GCM_TAG_LEN);
+            encryptedFile.insert(encryptedFile.end(), crypted.begin(), crypted.begin() + cryptlen);
+
+            if (!WriteEntireFile(tempPath, encryptedFile)) { sendstat("Can't write encrypted file!"); break; }
+            if (!ReplaceFileWithMove(tempPath, encPath)) {
+                DeleteFileA(tempPath);
+                sendstat("Rename fail!");
+                break;
             }
-            // Securely wipe original (now non-existent) just in case, then update outPath
-            strncpy(outPath, encPath, MAX_PATH);
-            sendstat("Success! File encrypted in-place. Only .enc remains.");
+            if (!WipeAndDeleteFile(filepath)) {
+                sendstat("Encrypted, but source cleanup failed.");
+            } else {
+                sendstat("Success! File encrypted. Only .enc remains.");
+            }
+            CopyStringSafe(outPath, sizeof(outPath), encPath);
             ok = TRUE;
         } else {
             // --- Decrypt file ---
@@ -243,7 +271,7 @@ void aesgcm_file_inplace_worker(WorkerParams* params) {
             memcpy(aad + MAGIC_LEN, salt, SALT_LEN);
             memcpy(aad + MAGIC_LEN + SALT_LEN, iv, IV_LEN);
 
-            BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO gcm = {0};
+            BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO gcm{};
             BCRYPT_INIT_AUTH_MODE_INFO(gcm);
             gcm.pbNonce = iv; gcm.cbNonce = IV_LEN;
             gcm.pbTag = storedTag; gcm.cbTag = GCM_TAG_LEN;
@@ -264,32 +292,33 @@ void aesgcm_file_inplace_worker(WorkerParams* params) {
             size_t plen = strlen(filepath);
             char origPath[MAX_PATH];
             if (plen > 4 && _stricmp(filepath + plen - 4, ".enc") == 0) {
-                strncpy(origPath, filepath, plen - 4); origPath[plen-4]=0;
+                memcpy(origPath, filepath, plen - 4);
+                origPath[plen - 4] = 0;
             } else {
                 snprintf(origPath, MAX_PATH, "%s.dec", filepath);
             }
 
-            // --- Securely wipe encrypted file, restore original ---
-            fout = fopen(filepath, "wb");
-            if (!fout) { sendstat("Can't write file!"); break; }
-            fwrite(plain.data(), 1, plainlen, fout);
-            fflush(fout); fclose(fout); fout = NULL;
-
-            // Remove any prior leftover; Restore to origPath
-            DeleteFileA(origPath);
-            if (!MoveFileA(filepath, origPath) && !MoveFileExA(filepath, origPath, MOVEFILE_REPLACE_EXISTING)) {
-                sendstat("Failed to restore original name!"); break;
+            char tempPath[MAX_PATH];
+            std::vector<BYTE> plainOut(plain.begin(), plain.begin() + plainlen);
+            snprintf(tempPath, MAX_PATH, "%s.tmp", origPath);
+            if (!WriteEntireFile(tempPath, plainOut)) { sendstat("Can't write decrypted file!"); break; }
+            if (!ReplaceFileWithMove(tempPath, origPath)) {
+                DeleteFileA(tempPath);
+                sendstat("Failed to restore original name!");
+                break;
             }
-            strncpy(outPath, origPath, MAX_PATH);
-            sendstat("Success! File fully restored/decrypted.");
+            if (!WipeAndDeleteFile(filepath)) {
+                sendstat("Decrypted, but encrypted source cleanup failed.");
+            } else {
+                sendstat("Success! File fully restored/decrypted.");
+            }
+            CopyStringSafe(outPath, sizeof(outPath), origPath);
             ok = TRUE;
         }
     } while(0);
 
     SecureZeroMemory(password, 128);
     SecureZeroMemory(key, KEY_LEN); SecureClean(key, KEY_LEN);
-    if (fin) fclose(fin);
-    if (fout) fclose(fout);
     if (hKey) BCryptDestroyKey(hKey);
     if (hAlg) BCryptCloseAlgorithmProvider(hAlg, 0);
     if (obj) { SecureZeroMemory(obj, objlen); SecureClean(obj, objlen); free(obj); }
@@ -298,10 +327,12 @@ void aesgcm_file_inplace_worker(WorkerParams* params) {
     SecureZeroMemory(tag, GCM_TAG_LEN); SecureClean(tag, GCM_TAG_LEN);
 
     if (ok && op == OP_ENCRYPT) {
-        PostMessageA(params->replyHwnd, WM_USER_SETS, (WPARAM)strdup(outPath), 1001);
+        char* posted = DupString(outPath);
+        if (posted) PostMessageA(params->replyHwnd, WM_USER_SETS, (WPARAM)posted, 1001);
     }
     else if (ok && op == OP_DECRYPT) {
-        PostMessageA(params->replyHwnd, WM_USER_SETS, (WPARAM)strdup(outPath), 1002);
+        char* posted = DupString(outPath);
+        if (posted) PostMessageA(params->replyHwnd, WM_USER_SETS, (WPARAM)posted, 1002);
     }
 
     free(params);
@@ -341,7 +372,7 @@ void set_status(const char* m) {
 
 // --- File selection dialog
 int get_file_path(HWND hwnd, char* filename, DWORD flg) {
-    OPENFILENAMEA ofn = { 0 };
+    OPENFILENAMEA ofn{};
     filename[0] = 0;
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = hwnd;
@@ -364,9 +395,14 @@ void launch_worker(HWND hwnd, int op) {
     }
     set_status(op == OP_ENCRYPT ? "Encrypting (worker)..." : "Decrypting (worker)...");
     WorkerParams* wp = (WorkerParams*)malloc(sizeof(WorkerParams));
+    if (!wp) {
+        set_status("Out of memory.");
+        SecureZeroMemory(password, sizeof(password));
+        return;
+    }
     memset(wp, 0, sizeof(WorkerParams));
-    strncpy(wp->file, input_file, MAX_PATH-1);
-    strncpy(wp->password, password, sizeof(wp->password)-1);
+    CopyStringSafe(wp->file, sizeof(wp->file), input_file);
+    CopyStringSafe(wp->password, sizeof(wp->password), password);
     wp->replyHwnd = hwnd;
     wp->op = op;
     std::thread(aesgcm_file_inplace_worker, wp).detach();
@@ -377,6 +413,7 @@ void do_browse(HWND hwnd) {
     if (get_file_path(hwnd, input_file, 0)) SetWindowTextA(hInput, input_file);
 }
 void do_debug(HWND hwnd) {
+    (void)hwnd;
     if (!debug_mode) {
         OpenDebugConsole();
         debug_mode = TRUE;
@@ -443,7 +480,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 
 // --- Entry Point ---
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
-    WNDCLASSA wc = { 0 };
+    WNDCLASSA wc{};
     wc.lpfnWndProc = MainWndProc;
     wc.hInstance = hInst;
     wc.lpszClassName = "EncryptorApp";
